@@ -1,0 +1,3 @@
+title,url,site_name,topic,content,summary,ai_summary,ai_category,ai_reason,score,candidate_reason,ai_relevance_score,ai_keep,ai_filter_reason,content_type,known_limit,quality_issue,review_required,status,error
+空调行业动态示例,https://example.com/air-conditioner-news,示例网站,空调 行业动态,示例正文：某机构发布空调行业运行情况，提到节能空调、渠道库存和消费需求变化。,示例正文：某机构发布空调行业运行情况，提到节能空调、渠道库存和消费需求变化。,该示例内容围绕空调行业运行情况，包含节能空调、库存和消费需求变化等信息。,产业数据,标题和正文均围绕空调行业动态，主题相关性较高。,85,标题和摘要命中空调行业动态,90,yes,候选与空调行业动态直接相关,html,,,,matched,
+空调报告预览示例,https://example.com/air-conditioner-report,示例报告源,空调 行业动态,示例公开简介：该报告介绍空调设备市场趋势，但完整报告需要付费。,示例公开简介：该报告介绍空调设备市场趋势，但完整报告需要付费。,该示例为报告公开简介，能反映空调设备市场趋势，但不是完整报告正文。,研究报告,页面是空调行业报告公开简介，适合保留为预览来源。,70,公开简介命中空调,75,yes,公开简介与空调行业相关,public_preview,完整报告受限,,,matched,

@@ -1,0 +1,3 @@
+quality,issue,review_required,status,site_name,extractor,source_type,category,publish_date,content_type,title,url,content_length,matched_keywords
+pass,,no,matched,示例网站,generic,search_candidate,产业数据,2026-06-04,html,空调行业动态示例,https://example.com/air-conditioner-news,36,空调 行业动态
+pass,,no,matched,示例报告源,generic,search_candidate,研究报告,2026-06-04,public_preview,空调报告预览示例,https://example.com/air-conditioner-report,28,空调

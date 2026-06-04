@@ -112,6 +112,13 @@ pipeline_runs/<topic>_<mode>/manifest.json
 pipeline_runs/<topic>_<mode>/sites/*.csv
 ```
 
+Minimal example outputs are bundled in:
+
+```text
+examples/sample_final.csv
+examples/sample_quality.csv
+```
+
 Report at least:
 
 ```text
