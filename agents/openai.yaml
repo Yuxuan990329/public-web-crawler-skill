@@ -1,0 +1,4 @@
+interface:
+  display_name: "Public Web Crawler"
+  short_description: "Crawl whitelisted public websites by topic"
+  default_prompt: "Crawl a topic from the public website whitelist and output a CSV."
