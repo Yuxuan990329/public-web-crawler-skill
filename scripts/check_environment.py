@@ -3,12 +3,14 @@ import json
 import sys
 from pathlib import Path
 
+from crawler_defaults import DEFAULT_WHITELIST
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 REQUIRED_FILES = [
     "SKILL.md",
     "requirements.txt",
-    "白名单网站模板_栏目优化.xlsx",
+    DEFAULT_WHITELIST,
     "scripts/run_pipeline.py",
     "scripts/start_crawler.py",
     "scripts/crawl_search_candidates.py",

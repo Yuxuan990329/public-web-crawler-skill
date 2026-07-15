@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from output_ownership import reserve_output_paths
 from summarize import REQUEST_TIMEOUT_SECONDS, get_summary_config, set_summary_mode
 
 
@@ -115,6 +116,8 @@ def main():
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
+    assigned_output = reserve_output_paths([args.output])[0] if args.output else None
+
     set_summary_mode(args.summary_mode)
     config = get_summary_config()
     input_path = Path(args.candidates)
@@ -144,7 +147,7 @@ def main():
             row["error"] = row.get("error", "") or "AI精筛剔除"
             output_rows.append(row)
 
-    path = Path(args.output) if args.output else output_path(input_path, args.topic)
+    path = assigned_output if assigned_output else output_path(input_path, args.topic)
     write_csv(output_rows, path)
     print(f"输入候选: {input_path}")
     print(f"输出候选: {path}")

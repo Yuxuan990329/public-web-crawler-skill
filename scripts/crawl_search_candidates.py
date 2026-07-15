@@ -3,7 +3,7 @@ import csv
 import json
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
@@ -16,6 +16,7 @@ from crawl_whitelist import (
     USER_AGENT,
     build_log_path,
     can_fetch,
+    canonical_url,
     build_output_path,
     crawl_url,
     dedupe_rows,
@@ -33,6 +34,7 @@ from crawl_whitelist import (
 )
 from discover_search_candidates import expand_topic_keywords
 from extractors import extract_page
+from output_ownership import reserve_output_paths
 from summarize import PROVIDERS, fallback_summary, set_summary_config, set_summary_mode, summarize_enhancement
 
 
@@ -50,10 +52,6 @@ def site_map_from_whitelist(path):
     return {site.site_name: site for site in read_sites(path)}
 
 
-def canonical_url(url):
-    return re.sub(r"[?#].*$", "", (url or "").strip()).rstrip("/")
-
-
 def attach_candidate_context(row, candidate, keywords):
     row["candidate_title"] = candidate.get("title", "")
     row["candidate_snippet"] = candidate.get("snippet", "")
@@ -66,22 +64,12 @@ def attach_candidate_context(row, candidate, keywords):
     apply_preview_quality_flags(row, candidate)
     if row.get("status") != "unmatched":
         return row
-    if len(row.get("content", "")) < 100:
-        row["error"] = "详情正文过短，未使用候选摘要兜底"
-        return row
-    fallback_hits = matched_keywords(
-        candidate.get("title", ""),
-        candidate.get("snippet", ""),
-        keywords,
-    )
-    if not fallback_hits:
-        return row
-    row["status"] = "matched"
-    row["matched_keywords"] = " ".join(fallback_hits)
-    row["error"] = "详情正文未命中，使用搜索候选摘要命中"
-    row["source_stage"] = "candidate_snippet_fallback"
-    ensure_ai_fields(row, keywords)
-    apply_preview_quality_flags(row, candidate)
+    # 搜索摘要只是候选发现线索，绝不能覆盖详情正文的未命中结论。
+    # 否则标题/摘要命中而正文无关的页面会被静默污染为可用证据。
+    row["review_required"] = "yes"
+    row["quality_issue"] = row.get("quality_issue") or "候选摘要命中但详情正文未命中"
+    row["error"] = "详情正文未命中；候选摘要仅作线索，已保留为待复核"
+    row["source_stage"] = "candidate_preview_only"
     return row
 
 
@@ -122,6 +110,15 @@ def apply_preview_quality_flags(row, candidate):
     elif site_name == "CBNData" and len(row.get("content", "")) < 100:
         row["quality_issue"] = "CBNData详情页正文不可用或过短"
         row["review_required"] = "yes"
+
+
+def validate_candidate_source(site, url):
+    """对所有候选入口强制执行同一来源边界，不让 preview 成为校验后门。"""
+    if not is_same_or_subdomain(url, site.domain):
+        return "URL 不匹配白名单域名"
+    if not can_fetch(url, USER_AGENT):
+        return "robots.txt 不允许访问"
+    return ""
 
 
 def public_preview_candidate_row(site, topic, candidate, keywords):
@@ -180,12 +177,24 @@ def is_detail_like_url(url):
 def score_link_for_topic(url, text, keywords):
     haystack = f"{text} {url}".lower()
     hits = [keyword for keyword in keywords if keyword.lower() in haystack]
+    if not hits:
+        return 0
     score = len(hits) * 30
     if is_detail_like_url(url):
         score += 15
     if re.search(r"20\d{2}", url):
         score += 5
     return score
+
+
+def enforce_list_detail_title_evidence(row, keywords):
+    if row.get("source_stage") != "list_expanded":
+        return row
+    if matched_keywords(row.get("title", ""), "", keywords):
+        return row
+    row["status"] = "unmatched"
+    row["matched_keywords"] = ""
+    return row
 
 
 def detail_links_from_list_candidate(site, url, keywords, limit):
@@ -290,6 +299,8 @@ def main():
     parser.add_argument("--whitelist", default=DEFAULT_WHITELIST, help="白名单 Excel 路径。")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="CSV 输出目录。")
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help="任务日志输出目录。")
+    parser.add_argument("--output", default="", help="由父任务指定的唯一 CSV 输出路径。")
+    parser.add_argument("--log-output", default="", help="由父任务指定的唯一任务日志路径。")
     parser.add_argument("--sites", default="", help="按 site_name 精确匹配多个站点，逗号分隔。")
     parser.add_argument("--min-score", type=int, default=30, help="候选最低 preliminary_score。")
     parser.add_argument("--limit-per-site", type=int, default=10, help="每个站点最多抓取 N 条候选，0 表示不限。")
@@ -319,6 +330,13 @@ def main():
     parser.add_argument("--summary-api-key", default="", help="一次性测试 API Key；不会写入文件。")
     parser.add_argument("--summary-model", default="", help="一次性测试模型名。")
     args = parser.parse_args()
+
+    assigned_output = None
+    assigned_log = None
+    if args.output or args.log_output:
+        if not args.output or not args.log_output:
+            raise ValueError("--output and --log-output must be provided together.")
+        assigned_output, assigned_log = reserve_output_paths([args.output, args.log_output])
     started_at = datetime.now()
 
     if args.summary_api_key or args.summary_provider or args.summary_api_url or args.summary_model:
@@ -352,12 +370,30 @@ def main():
         if not site or site.enabled != "yes":
             skipped_missing_sites += 1
             continue
+        candidate_url = candidate["candidate_url"]
+        source_error = validate_candidate_source(site_for_url(site, candidate_url), candidate_url)
+        if source_error:
+            output_rows.append(
+                result_row(
+                    site,
+                    args.topic,
+                    candidate_url,
+                    "search_candidate",
+                    status="skipped",
+                    error=source_error,
+                    candidate_title=candidate.get("title", ""),
+                    candidate_snippet=candidate.get("snippet", ""),
+                    score=candidate.get("preliminary_score", ""),
+                    source_stage="candidate_source_validation",
+                    candidate_reason=candidate.get("reason", ""),
+                )
+            )
+            continue
         if "public_preview_only" in candidate.get("reason", ""):
             row = public_preview_candidate_row(site, args.topic, candidate, keywords)
             if not args.matched_only or row.get("status") == "matched":
                 output_rows.append(row)
             continue
-        candidate_url = candidate["candidate_url"]
         if canonical_url(candidate_url) == canonical_url(site.url):
             continue
         urls_to_crawl = []
@@ -389,22 +425,25 @@ def main():
                 row = attach_candidate_context(result, candidate, keywords)
             if row.get("source_stage") == "detail":
                 row["source_stage"] = source_stage
+            row = enforce_list_detail_title_evidence(row, keywords)
             output_rows.append(row)
             time.sleep(args.request_delay)
 
-    rows = output_rows
+    pre_filter_rows = output_rows
+    pre_filter_status_counts = Counter(row.get("status", "") for row in pre_filter_rows)
+    rows = pre_filter_rows
     if args.matched_only:
         rows = list(filter_matched(rows))
     if not args.no_dedupe:
         rows = list(dedupe_rows(rows))
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = build_output_path(output_dir, args.topic)
+    output_path = assigned_output if assigned_output else build_output_path(Path(args.output_dir), args.topic)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     write_csv(rows, output_path)
 
     finished_at = datetime.now()
-    log_path = build_log_path(args.log_dir, output_path)
+    log_path = assigned_log if assigned_log else build_log_path(args.log_dir, output_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     write_task_log(
         log_path,
         {
@@ -420,6 +459,8 @@ def main():
             "selected_count": len(selected_rows),
             "expanded_detail_count": expanded_detail_count,
             "skipped_missing_sites": skipped_missing_sites,
+            "pre_filter_row_count": len(pre_filter_rows),
+            "pre_filter_status_counts": dict(pre_filter_status_counts),
             "matched_only": args.matched_only,
             "match_mode": args.match_mode,
             "min_score": args.min_score,

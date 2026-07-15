@@ -73,18 +73,23 @@ python scripts/run_pipeline.py --topic "AI" --mode quick --whitelist 白名单�
 
 ## Outputs
 
-Main output:
+For resumed or unattended runs, the manifest is the authoritative output locator:
 
 ```text
-outputs/*_final.csv
+pipeline_runs/<topic>_<mode>_<fingerprint16>/manifest.json
+manifest.final_path
 ```
 
-Supporting outputs:
+For runs without `--resume`, use the exact path printed by the command. Do not scan by modification time or select a "latest" filename.
+
+Each execution owns an isolated output directory:
 
 ```text
-outputs/*_搜索候选.csv
-outputs/*_quality.csv
-pipeline_runs/<topic>_<mode>/manifest.json
+outputs/<execution_id>/candidates.csv
+outputs/<execution_id>/quality.csv
+outputs/<execution_id>/final.csv
+logs/<execution_id>/*.json
+pipeline_runs/<topic>_<mode>_<fingerprint16>/sites/*.csv
 ```
 
 Sample files:

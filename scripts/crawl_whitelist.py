@@ -1,32 +1,37 @@
 import argparse
 import csv
+import http.client
 import io
 import json
+import ipaddress
 import re
+import socket
 import ssl
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 from urllib import robotparser
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.request import HTTPHandler, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener, urlopen
 
 from openpyxl import load_workbook
 
+from crawler_defaults import DEFAULT_WHITELIST
 from extractors import clean_text, extract_page
 from summarize import PROVIDERS, fallback_summary, set_summary_config, set_summary_mode, summarize_enhancement
 
 
-DEFAULT_WHITELIST = "白名单网站模板.xlsx"
 DEFAULT_OUTPUT_DIR = "outputs"
 DEFAULT_LOG_DIR = "logs"
 USER_AGENT = "CodexWhitelistCrawler/0.1 (+public whitelist research)"
 REQUEST_TIMEOUT_SECONDS = 15
 REQUEST_DELAY_SECONDS = 1.5
-INSECURE_SSL_DOMAINS = {"qianzhan.com"}
+KNOWN_TLS_CHAIN_LIMIT_DOMAINS = {"qianzhan.com"}
+KNOWN_TLS_CHAIN_ERROR_CODES = {20, 21}
 
 CLASSIFICATION_KEYWORDS = {
     "政策": ["政策", "通知", "公告", "规划", "条例", "办法", "意见"],
@@ -64,9 +69,17 @@ def is_same_or_subdomain(url, domain):
     return target == allowed or target.endswith("." + allowed)
 
 
-def is_insecure_ssl_domain(url):
-    target = url_domain(url)
-    return any(target == domain or target.endswith("." + domain) for domain in INSECURE_SSL_DOMAINS)
+def request_safe_url(url):
+    parts = urlsplit(url)
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            quote(parts.path, safe="/%"),
+            quote(parts.query, safe="=&?/:+,%"),
+            parts.fragment,
+        )
+    )
 
 
 def read_sites(path):
@@ -182,19 +195,147 @@ def can_fetch(url, user_agent):
     parser = robotparser.RobotFileParser()
     parser.set_url(robots_url)
     try:
-        parser.read()
-    except Exception:
-        return True
+        with safe_open(robots_url, parsed.hostname) as response:
+            raw = response.read()
+        parser.parse(raw.decode("utf-8", errors="replace").splitlines())
+    except UnsafeTargetError:
+        return False
+    except HTTPError as exc:
+        exc.close()
+        return exc.code in {404, 410}
+    except URLError as exc:
+        if tls_verification_failure(exc):
+            raise
+        return False
+    except (TimeoutError, OSError):
+        return False
     return parser.can_fetch(user_agent, url)
 
 
-def fetch_html(url):
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    context = None
-    if is_insecure_ssl_domain(url):
-        print(f"警告: {url_domain(url)} SSL 证书校验失败风险已知，本次请求仅对该域名使用 verify=False。")
-        context = ssl._create_unverified_context()
-    with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS, context=context) as response:
+class UnsafeTargetError(ValueError):
+    pass
+
+
+def _is_public_ip(value):
+    ip = ipaddress.ip_address(value)
+    if not ip.is_global or ip.is_multicast or getattr(ip, "is_site_local", False):
+        return False
+    embedded = [getattr(ip, "ipv4_mapped", None), getattr(ip, "sixtofour", None)]
+    teredo = getattr(ip, "teredo", None)
+    if teredo:
+        embedded.extend(teredo)
+    for candidate in embedded:
+        if candidate is not None and not _is_public_ip(str(candidate)):
+            return False
+    for prefix in (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48")):
+        if ip.version == 6 and ip in prefix:
+            mapped = ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+            if not _is_public_ip(str(mapped)):
+                return False
+    return True
+
+
+def resolve_public_addresses(host, port):
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise UnsafeTargetError(f"无法解析目标域名: {host}") from exc
+    if not addresses or any(not _is_public_ip(item[4][0]) for item in addresses):
+        raise UnsafeTargetError("目标域名解析到非公网 IP，已拒绝请求")
+    return addresses
+
+
+def validate_public_target(url, allowed_domain):
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise UnsafeTargetError("仅允许 HTTP/HTTPS 请求")
+    if not is_same_or_subdomain(url, allowed_domain):
+        raise UnsafeTargetError("重定向目标不匹配白名单域名")
+    host = parsed.hostname
+    if not host:
+        raise UnsafeTargetError("请求 URL 缺少主机名")
+    resolve_public_addresses(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+
+
+def _create_public_connection(host, port, timeout, source_address=None):
+    addresses = resolve_public_addresses(host, port)
+    last_error = None
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise UnsafeTargetError("目标域名没有可用的公网地址")
+
+
+class PublicHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = _create_public_connection(self.host, self.port, self.timeout, self.source_address)
+        if self._tunnel_host:
+            raise UnsafeTargetError("禁止通过代理隧道访问白名单站点")
+
+
+class PublicHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        self.sock = _create_public_connection(self.host, self.port, self.timeout, self.source_address)
+        if self._tunnel_host:
+            raise UnsafeTargetError("禁止通过代理隧道访问白名单站点")
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+class PublicHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(PublicHTTPConnection, req)
+
+
+class PublicHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PublicHTTPSConnection, req, context=self._context)
+
+
+class SafeRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, allowed_domain):
+        super().__init__()
+        self.allowed_domain = allowed_domain
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urljoin(req.full_url, newurl)
+        validate_public_target(target, self.allowed_domain)
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
+def safe_open(url, allowed_domain):
+    validate_public_target(url, allowed_domain)
+    request = Request(request_safe_url(url), headers={"User-Agent": USER_AGENT})
+    opener = build_opener(
+        ProxyHandler({}),
+        PublicHTTPHandler(),
+        PublicHTTPSHandler(),
+        SafeRedirectHandler(allowed_domain),
+    )
+    response = opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS)
+    final_url = response.geturl()
+    try:
+        validate_public_target(final_url, allowed_domain)
+    except Exception:
+        response.close()
+        raise
+    return response
+
+
+def fetch_html(url, allowed_domain=None):
+    allowed_domain = allowed_domain or url_domain(url)
+    with safe_open(url, allowed_domain) as response:
         content_type = response.headers.get("Content-Type", "")
         if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
             raise ValueError(f"非 HTML 内容: {content_type}")
@@ -207,13 +348,9 @@ def fetch_html(url):
     return raw.decode("utf-8", errors="ignore")
 
 
-def fetch_pdf_text(url):
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    context = None
-    if is_insecure_ssl_domain(url):
-        print(f"警告: {url_domain(url)} SSL 证书校验失败风险已知，本次请求仅对该域名使用 verify=False。")
-        context = ssl._create_unverified_context()
-    with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS, context=context) as response:
+def fetch_pdf_text(url, allowed_domain=None):
+    allowed_domain = allowed_domain or url_domain(url)
+    with safe_open(url, allowed_domain) as response:
         content_type = response.headers.get("Content-Type", "")
         if "pdf" not in content_type.lower() and not url.lower().endswith(".pdf"):
             raise ValueError(f"非 PDF 内容: {content_type}")
@@ -370,29 +507,83 @@ def result_row(
     }
 
 
+def tls_verification_failure(exc):
+    reason = exc.reason if isinstance(exc, URLError) else exc
+    if not isinstance(reason, ssl.SSLCertVerificationError):
+        return None
+    code = getattr(reason, "verify_code", None)
+    message = clean_text(getattr(reason, "verify_message", "") or str(reason))
+    return code, message
+
+
+def is_known_tls_chain_limit(url, code, message):
+    domain = url_domain(url)
+    known_domain = any(domain == allowed or domain.endswith("." + allowed) for allowed in KNOWN_TLS_CHAIN_LIMIT_DOMAINS)
+    return known_domain and code in KNOWN_TLS_CHAIN_ERROR_CODES
+
+
+def tls_failure_row(site, topic, url, source_type, exc):
+    tls_failure = tls_verification_failure(exc)
+    if not tls_failure:
+        return None
+    code, message = tls_failure
+    if is_known_tls_chain_limit(url, code, message):
+        return result_row(
+            site,
+            topic,
+            url,
+            source_type,
+            status="skipped",
+            error=f"tls_certificate_chain_unavailable: {code or 'unknown'} {message}",
+            known_limit="TLS证书链不可用，已保持证书校验并跳过抓取",
+        )
+    return result_row(
+        site,
+        topic,
+        url,
+        source_type,
+        status="failed",
+        error=f"tls_certificate_rejected: {code or 'unknown'} {message}",
+        quality_issue="TLS证书校验失败，需核验站点或本机信任链",
+        review_required="yes",
+    )
+
+
 def crawl_url(site, topic, keywords, url, source_type, match_mode="any", date_from=None, date_to=None, include_pdfs=False):
     if not is_same_or_subdomain(url, site.domain):
         return result_row(site, topic, url, source_type, status="skipped", error="URL 不匹配白名单域名")
-    if not can_fetch(url, USER_AGENT):
+    try:
+        robots_allowed = can_fetch(url, USER_AGENT)
+    except URLError as exc:
+        tls_row = tls_failure_row(site, topic, url, source_type, exc)
+        if tls_row:
+            return tls_row
+        return result_row(site, topic, url, source_type, status="skipped", error="robots.txt 获取失败，已拒绝访问")
+    if not robots_allowed:
         return result_row(site, topic, url, source_type, status="skipped", error="robots.txt 不允许访问")
     try:
         if re.search(r"\.pdf(\?|$)", url, re.I):
             if not include_pdfs:
                 return result_row(site, topic, url, source_type, status="skipped", error="PDF 提取未开启", content_type="pdf")
             title = clean_text(url.rsplit("/", 1)[-1])
-            content = fetch_pdf_text(url)
+            content = fetch_pdf_text(url, site.domain)
             links = []
             extractor = "pdf"
             content_type = "pdf"
         else:
-            html = fetch_html(url)
+            html = fetch_html(url, site.domain)
             page = extract_page(url, html)
             title, content, links = page.title, page.content, page.links
             extractor = page.extractor
             content_type = "html"
     except HTTPError as exc:
         return result_row(site, topic, url, source_type, status="failed", error=f"HTTP {exc.code}")
-    except (URLError, TimeoutError, ValueError) as exc:
+    except URLError as exc:
+        tls_row = tls_failure_row(site, topic, url, source_type, exc)
+        if tls_row:
+            return tls_row
+        return result_row(site, topic, url, source_type, status="failed", error=str(exc))
+    except (TimeoutError, ValueError) as exc:
         return result_row(site, topic, url, source_type, status="failed", error=str(exc))
 
     if not clean_text(content):
@@ -588,7 +779,14 @@ def filter_matched(rows: Iterable[dict]):
 
 def canonical_url(url):
     parsed = urlparse(url or "")
-    return parsed._replace(query="", fragment="").geturl().rstrip("/")
+    query = urlencode(
+        sorted(
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_") and key.lower() not in {"spm", "from", "source"}
+        )
+    )
+    return parsed._replace(query=query, fragment="").geturl().rstrip("/")
 
 
 def dedupe_rows(rows: Iterable[dict]):
@@ -606,8 +804,8 @@ def dedupe_rows(rows: Iterable[dict]):
 
 def build_output_path(output_dir, topic):
     safe_topic = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", topic).strip("_") or "crawl"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(output_dir) / f"{timestamp}_{safe_topic}.csv"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return Path(output_dir) / f"{timestamp}_{uuid.uuid4().hex}_{safe_topic}.csv"
 
 
 def build_log_path(log_dir, output_path):

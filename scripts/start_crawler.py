@@ -24,7 +24,7 @@ def ask_yes_no(prompt, default=True):
 
 
 def choose_mode():
-    value = ask("运行模式 quick/full", "quick").lower()
+    value = ask("运行模式 quick/full", "full").lower()
     return "full" if value == "full" else "quick"
 
 

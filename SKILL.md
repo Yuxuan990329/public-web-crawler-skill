@@ -38,6 +38,10 @@ enhanced quick = quick crawl with DeepSeek summary/classification, API fee
 enhanced full  = full crawl with DeepSeek, higher API fee, require explicit user confirmation
 ```
 
+For market-opportunity industry analysis, the default is **basic full**: run the
+complete public-crawl pipeline in `full` mode with `--summary-mode excerpt`.
+It does not call DeepSeek. Use enhanced full only with explicit cost approval.
+
 If the user gives a topic but no mode, ask them to choose from those four options.
 
 ## Commands
@@ -97,19 +101,23 @@ Use `summary_api.local.json` for personal machines only. Do not expose API keys 
 
 ## Output
 
-Prioritize the final CSV:
+For resumed or unattended runs, use the manifest as the authoritative locator:
 
 ```text
-outputs/*_final.csv
+pipeline_runs/<topic>_<mode>_<fingerprint16>/manifest.json
+manifest.final_path
 ```
 
-Useful supporting outputs:
+For runs without `--resume`, use the exact output path printed by the command. Do not scan by modification time or select a "latest" filename.
+
+Current-execution outputs use an isolated execution ID:
 
 ```text
-outputs/*_搜索候选.csv
-outputs/*_quality.csv
-pipeline_runs/<topic>_<mode>/manifest.json
-pipeline_runs/<topic>_<mode>/sites/*.csv
+outputs/<execution_id>/candidates.csv
+outputs/<execution_id>/quality.csv
+outputs/<execution_id>/final.csv
+logs/<execution_id>/*.json
+pipeline_runs/<topic>_<mode>_<fingerprint16>/sites/*.csv
 ```
 
 Minimal example outputs are bundled in:

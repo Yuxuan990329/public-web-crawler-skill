@@ -3,6 +3,8 @@ import csv
 from collections import Counter
 from pathlib import Path
 
+from output_ownership import reserve_output_paths
+
 
 NOISE_MARKERS = [
     "请登录",
@@ -49,6 +51,8 @@ def main():
     parser.add_argument("--output", default="", help="Quality CSV output path.")
     args = parser.parse_args()
 
+    assigned_output = reserve_output_paths([args.output])[0] if args.output else None
+
     input_path = Path(args.csv_path)
     rows = list(csv.DictReader(open(input_path, encoding="utf-8-sig")))
     status_counter = Counter(row.get("status", "") for row in rows)
@@ -79,7 +83,7 @@ def main():
             }
         )
 
-    output_path = Path(args.output) if args.output else input_path.with_name(input_path.stem + "_quality.csv")
+    output_path = assigned_output if assigned_output else input_path.with_name(input_path.stem + "_quality.csv")
     fields = [
         "quality",
         "issue",

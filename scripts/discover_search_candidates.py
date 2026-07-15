@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from crawl_whitelist import (
     url_domain,
 )
 from extractors import clean_text, extract_page
+from output_ownership import reserve_output_paths
 
 
 SEARCH_TEMPLATES = {
@@ -49,6 +51,10 @@ AI_EXPANSION_KEYWORDS = [
     "算力",
 ]
 
+DIAGNOSTIC_QUERY_TERMS = {"回归测试", "修复后复测"}
+
+TOPIC_SCOPE_MARKERS = ("行业", "产业", "市场", "发展", "变化", "趋势", "报告", "研究")
+
 POSITIVE_PAGE_HINTS = [
     "news",
     "brief",
@@ -64,6 +70,7 @@ POSITIVE_PAGE_HINTS = [
 NEGATIVE_PAGE_HINTS = [
     "login",
     "register",
+    "search",
     "rss",
     "english",
     "cart",
@@ -118,8 +125,37 @@ def split_keywords(value):
     return [part.strip() for part in re.split(r"[,，\s]+", value or "") if part.strip()]
 
 
+def remove_diagnostic_terms(keywords):
+    cleaned = []
+    for keyword in keywords:
+        for term in DIAGNOSTIC_QUERY_TERMS:
+            keyword = keyword.replace(term, "").strip()
+        if keyword:
+            cleaned.append(keyword)
+    return cleaned
+
+
+def core_topic_term(keyword):
+    """只返回可独立作为准入证据的实体词，范围/意图词不能单独得分。"""
+    normalized = (keyword or "").strip()
+    if not normalized:
+        return ""
+    marker_positions = [normalized.find(marker) for marker in TOPIC_SCOPE_MARKERS if marker in normalized]
+    if marker_positions:
+        prefix = normalized[: min(marker_positions)].strip()
+        # “行业动态”“市场趋势”没有实体词，不能作为业务准入证据。
+        return prefix if len(prefix) >= 2 else ""
+    return normalized
+
+
 def expand_topic_keywords(topic):
-    keywords = split_keywords(topic)
+    keywords = []
+    for keyword in remove_diagnostic_terms(split_keywords(topic)):
+        core_term = core_topic_term(keyword)
+        if not core_term:
+            continue
+        if core_term.lower() not in {item.lower() for item in keywords}:
+            keywords.append(core_term)
     lowered = {keyword.lower() for keyword in keywords}
     if "ai" in lowered or "人工智能" in keywords:
         for keyword in AI_EXPANSION_KEYWORDS:
@@ -127,6 +163,14 @@ def expand_topic_keywords(topic):
                 keywords.append(keyword)
                 lowered.add(keyword.lower())
     return keywords
+
+
+def build_search_queries(topic, explicit_queries=""):
+    if explicit_queries:
+        queries = remove_diagnostic_terms(split_keywords(explicit_queries))
+        if queries:
+            return queries
+    return expand_topic_keywords(topic)
 
 
 def templates_for_site(site):
@@ -187,15 +231,20 @@ def link_context_snippet(html, href, fallback_text="", window=1200):
 
 
 def score_candidate(url, title, keywords, snippet=""):
-    title_matches = matched_keywords(f"{title} {snippet}", keywords)
+    title_matches = matched_keywords(title, keywords)
     url_lower = url.lower()
+    parsed = urlparse(url)
     positives = [hint for hint in POSITIVE_PAGE_HINTS if hint in url_lower]
     negatives = [hint for hint in NEGATIVE_PAGE_HINTS if hint in url_lower]
-    score = len(title_matches) * 30 + len(positives) * 5 - len(negatives) * 30
+    if parsed.path in {"", "/"}:
+        negatives.append("root")
+    score = len(title_matches) * 20 + len(positives) * 10 - len(negatives) * 30
     if re.search(r"/20\d{2}/|20\d{2}", url_lower):
         score += 5
     if len(clean_text(title)) >= 8:
         score += 3
+    if not title_matches:
+        score = min(score, 29)
     return score, title_matches, positives, negatives
 
 
@@ -500,8 +549,8 @@ def discover_from_search(site, query, search_url, keywords, limit):
 
 def output_path(output_dir, topic):
     safe_topic = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", topic).strip("_") or "search"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(output_dir) / f"{timestamp}_{safe_topic}_搜索候选.csv"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return Path(output_dir) / f"{timestamp}_{uuid.uuid4().hex}_{safe_topic}_搜索候选.csv"
 
 
 def main():
@@ -509,12 +558,15 @@ def main():
     parser.add_argument("--topic", required=True, help="主题，例如 AI 或 人工智能。")
     parser.add_argument("--whitelist", default=DEFAULT_WHITELIST, help="白名单 Excel 路径。")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="CSV 输出目录。")
+    parser.add_argument("--output", default="", help="由父任务指定的唯一 CSV 输出路径。")
     parser.add_argument("--sites", default="", help="按 site_name 精确匹配多个站点，逗号分隔。")
     parser.add_argument("--queries", default="", help="覆盖搜索词，逗号/空格分隔；默认由 topic 自动扩展。")
     parser.add_argument("--limit-sites", type=int, default=0, help="只处理前 N 个启用站点，0 表示不限制。")
     parser.add_argument("--limit-per-search", type=int, default=20, help="每个搜索 URL 最多输出 N 条候选。")
     parser.add_argument("--include-disabled", action="store_true", help="包含 enabled=no 的站点，仅用于诊断；仍尊重 robots.txt。")
     args = parser.parse_args()
+
+    assigned_output = reserve_output_paths([args.output])[0] if args.output else None
 
     sites = read_sites(args.whitelist)
     if not args.include_disabled:
@@ -523,11 +575,8 @@ def main():
     if args.limit_sites > 0:
         sites = sites[: args.limit_sites]
 
-    queries = split_keywords(args.queries) if args.queries else expand_topic_keywords(args.topic)
+    queries = build_search_queries(args.topic, args.queries)
     keywords = expand_topic_keywords(args.topic)
-    for query in queries:
-        if query.lower() not in {keyword.lower() for keyword in keywords}:
-            keywords.append(query)
 
     rows = []
     for site in sites:
@@ -550,9 +599,8 @@ def main():
             except Exception as exc:
                 rows.append(candidate_row(site, query, search_url, status="failed", error=str(exc)))
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_path(output_dir, args.topic)
+    path = assigned_output if assigned_output else output_path(Path(args.output_dir), args.topic)
+    path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "site_name",
         "category",
